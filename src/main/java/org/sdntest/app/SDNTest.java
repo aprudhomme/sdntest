@@ -26,7 +26,6 @@ import org.onlab.packet.Ethernet;
 import org.onlab.packet.ARP;
 import org.onlab.packet.IpAddress;
 import org.onlab.packet.Ip4Address;
-//import org.onlab.packet.MacAddress;
 import org.onlab.packet.ICMP;
 import org.onlab.packet.ICMP6;
 import org.onlab.packet.IPv4;
@@ -87,7 +86,7 @@ import static com.google.common.base.Preconditions.checkNotNull;
 import static org.onosproject.security.AppGuard.checkPermission;
 import static com.google.common.base.Preconditions.checkArgument;
 /**
- * Sample reactive forwarding application.
+ * Sample forwarding application modified for vlan testing.
  */
 @Component(immediate = true)
 public class SDNTest {
@@ -186,24 +185,11 @@ public class SDNTest {
                     "default is false")
     private boolean matchIcmpFields = false;
 
-    //private Map<String, Map<Short, Short>> vlanMapIn;
-    //private Map<String, Map<Short, Short>> vlanMapOut;
-
     private Map<String, Map<String, Map<Short, Short>>> vlanDstIpMap;
     private Map<String, Map<String, Map<Short, Short>>> vlanTransMacMap;
     private Map<String, Map<String, Map<Short, Short>>> vlanDstMacMap;
 
     private void initVlanMap() {
-        /*vlanMapIn = new HashMap<String, Map<Short, Short>>();
-        vlanMapIn.put("00:00:00:00:00:01", new HashMap<Short, Short>());
-        vlanMapIn.get("00:00:00:00:00:01").put((short) 10, (short) 7);
-        vlanMapIn.put("00:00:00:00:00:02", new HashMap<Short, Short>());
-        vlanMapIn.get("00:00:00:00:00:02").put((short) 5, (short) 7);
-        vlanMapOut = new HashMap<String, Map<Short, Short>>();
-        vlanMapOut.put("00:00:00:00:00:01", new HashMap<Short, Short>());
-        vlanMapOut.get("00:00:00:00:00:01").put((short) 7, (short) 10);
-        vlanMapOut.put("00:00:00:00:00:02", new HashMap<Short, Short>());
-        vlanMapOut.get("00:00:00:00:00:02").put((short) 7, (short) 5);*/
 
         vlanDstIpMap = new HashMap<String, Map<String, Map<Short, Short>>>();
         vlanDstIpMap.put("00:00:00:00:00:01", new HashMap<String, Map<Short, Short>>());
@@ -271,8 +257,6 @@ public class SDNTest {
         TrafficSelector.Builder selector = DefaultTrafficSelector.builder();
         selector.matchEthType(Ethernet.TYPE_IPV4);
         packetService.requestPackets(selector.build(), PacketPriority.REACTIVE, appId);
-        //selector.matchEthType(Ethernet.TYPE_VLAN);
-        //packetService.requestPackets(selector.build(), PacketPriority.REACTIVE, appId);
         selector.matchEthType(Ethernet.TYPE_ARP);
         packetService.requestPackets(selector.build(), PacketPriority.REACTIVE, appId);
         selector.matchEthType(Ethernet.TYPE_IPV6);
@@ -286,8 +270,6 @@ public class SDNTest {
         TrafficSelector.Builder selector = DefaultTrafficSelector.builder();
         selector.matchEthType(Ethernet.TYPE_IPV4);
         packetService.cancelPackets(selector.build(), PacketPriority.REACTIVE, appId);
-        //selector.matchEthType(Ethernet.TYPE_VLAN);
-        //packetService.cancelPackets(selector.build(), PacketPriority.REACTIVE, appId);
         selector.matchEthType(Ethernet.TYPE_ARP);
         packetService.cancelPackets(selector.build(), PacketPriority.REACTIVE, appId);
         selector.matchEthType(Ethernet.TYPE_IPV6);
@@ -458,13 +440,11 @@ public class SDNTest {
 
         @Override
         public void process(PacketContext context) {
-            //log.info("Got packet");
             // Stop processing if the packet has been handled, since we
             // can't do any more to it.
-            //if (context.isHandled()) {
-                //return;
-            //}
-            //log.info("not handled");
+            if (context.isHandled()) {
+                return;
+            }
 
             InboundPacket pkt = context.inPacket();
             Ethernet ethPkt = pkt.parsed();
@@ -472,13 +452,11 @@ public class SDNTest {
             if (ethPkt == null) {
                 return;
             }
-            //log.info("eth packet");
 
             // Bail if this is deemed to be a control packet.
             if (isControlPacket(ethPkt)) {
                 return;
             }
-            //log.info("not control");
 
             HostId id = HostId.hostId(ethPkt.getDestinationMAC());
             HostId sid = HostId.hostId(ethPkt.getSourceMAC());
@@ -488,14 +466,14 @@ public class SDNTest {
                 return;
             }
 
-            log.info("not local smac: {}, dmac: {}, type: {}",
+            log.info("smac: {}, dmac: {}, type: {}",
                     ethPkt.getSourceMAC(), ethPkt.getDestinationMAC(), ethPkt.getEtherType());
             log.info("vlan: {}, loc: {}.", ethPkt.getVlanID(), context.inPacket().receivedFrom());
+
+            // do proxy arp
             if (ethPkt.getEtherType() == Ethernet.TYPE_ARP) {
                 handleArp(context, ethPkt);
                 return;
-            } else {
-                log.info("Not arp.");
             }
 
             Boolean mapVlans = false;
@@ -536,22 +514,20 @@ public class SDNTest {
                 id = HostId.hostId(ethPkt.getDestinationMAC(), VlanId.vlanId(inVlan));
             }
 
-            log.info("Hids: {}, Hidd: {}.", sid, id);
+            //log.info("Hids: {}, Hidd: {}.", sid, id);
 
             Host dst = hostService.getHost(id);
             Host src = hostService.getHost(sid);
 
-            log.info("Hs: {}, Hd: {}.", src, dst);
+            //log.info("Hs: {}, Hd: {}.", src, dst);
 
             // Do we know who this is for? If not, flood and bail.
             if (dst == null) {
-                // fix for vlan
+                // TODO: fix for vlan, only send out edges
                 log.info("flood dev: {}", pkt.receivedFrom().deviceId());
                 flood(context);
                 return;
             }
-
-            //log.info("hosts found");
 
             // Otherwise, get a set of paths that lead from here to the
             // destination edge switch.
@@ -565,18 +541,8 @@ public class SDNTest {
                 return;
             }
 
+            // TODO: select path based on some property
             Path path = (Path) paths.toArray()[0];
-
-            // Otherwise, pick a path that does not lead back to where we
-            // came from; if no such path, flood and bail.
-            //Path path = pickForwardPath(paths, pkt.receivedFrom().port());
-            //if (path == null) {
-            //    log.warn("Doh... don't know where to go... {} -> {} received on {}",
-            //             ethPkt.getSourceMAC(), ethPkt.getDestinationMAC(),
-            //             pkt.receivedFrom());
-            //    flood(context);
-            //    return;
-            //}
 
             // Otherwise forward and be done with it.
             installRules(context, path, mapVlans, inVlan, transVlan, outVlan);
@@ -649,9 +615,7 @@ public class SDNTest {
             }
         }
 
-        if (ethPkt.getEtherType() != Ethernet.TYPE_ARP) {
-            packetOut(context, PortNumber.TABLE);
-        }
+        packetOut(context, PortNumber.TABLE);
     }
 
     // Install a rule forwarding the packet to the specified port.
@@ -659,28 +623,11 @@ public class SDNTest {
             Short vlanIn, Short vlanOut) {
         log.info("install rule: device: {}, port: {}, map: {}, vIn: {}, vout: {}", device, portNumber,
                 mapVlan, vlanIn, vlanOut);
-        //
-        // We don't support (yet) buffer IDs in the Flow Service so
-        // packet out first.
-        //
+
         Ethernet inPkt = context.inPacket().parsed();
         TrafficSelector.Builder selectorBuilder = DefaultTrafficSelector.builder();
 
-        // If ARP packet than forward directly to output port
-        if (inPkt.getEtherType() == Ethernet.TYPE_ARP) {
-            if (context.inPacket().receivedFrom().deviceId().equals(device)) {
-                packetOut(context, portNumber);
-            }
-            return;
-        }
-
-        //
-        // If matchDstMacOnly
-        //    Create flows matching dstMac only
-        // Else
-        //    Create flows with default matching and include configured fields
-        //
-        if (matchDstMacOnly) {
+        if (false) {
             selectorBuilder.matchEthDst(inPkt.getDestinationMAC());
         } else {
             selectorBuilder.matchEthSrc(inPkt.getSourceMAC())
@@ -775,21 +722,15 @@ public class SDNTest {
                 }
             }
         }
-        TrafficTreatment treatment;
+        TrafficTreatment.Builder treatment = DefaultTrafficTreatment.builder();
         if (mapVlan && !vlanIn.equals(vlanOut)) {
-            treatment = DefaultTrafficTreatment.builder()
-                .setOutput(portNumber)
-                .setVlanId(VlanId.vlanId(vlanOut))
-                .build();
-        } else {
-            treatment = DefaultTrafficTreatment.builder()
-                    .setOutput(portNumber)
-                    .build();
+            treatment = treatment.setVlanId(VlanId.vlanId(vlanOut));
         }
+        treatment = treatment.setOutput(portNumber);
 
         ForwardingObjective forwardingObjective = DefaultForwardingObjective.builder()
                 .withSelector(selectorBuilder.build())
-                .withTreatment(treatment)
+                .withTreatment(treatment.build())
                 .withPriority(flowPriority)
                 .withFlag(ForwardingObjective.Flag.VERSATILE)
                 .fromApp(appId)
@@ -798,18 +739,6 @@ public class SDNTest {
 
         flowObjectiveService.forward(device,
                                      forwardingObjective);
-
-        //
-        // If packetOutOfppTable
-        //  Send packet back to the OpenFlow pipeline to match installed flow
-        // Else
-        //  Send packet direction on the appropriate port
-        //
-        //if (packetOutOfppTable) {
-        //    packetOut(context, PortNumber.TABLE);
-        //} else {
-        //    packetOut(context, portNumber);
-        //}
     }
 
     private boolean handleArp(PacketContext context, Ethernet ethPkt) {
@@ -817,20 +746,16 @@ public class SDNTest {
         //log.info("Doing arp.");
 
         short dstVlan = ethPkt.getVlanID();
-        //log.info("MACsrc: {}.", ethPkt.getSourceMAC().toString());
         if (vlanDstIpMap.containsKey(ethPkt.getSourceMAC().toString())) {
-            //log.info("Src MAC found");
             Ip4Address targetAddress = Ip4Address.valueOf(arp.getTargetProtocolAddress());
             if (vlanDstIpMap.get(ethPkt.getSourceMAC().toString())
                     .containsKey(targetAddress.toString())) {
-                //log.info("Dst Ip found");
                 if (vlanDstIpMap.get(ethPkt.getSourceMAC().toString())
                     .get(targetAddress.toString())
                     .containsKey(dstVlan)) {
                     dstVlan = vlanDstIpMap.get(ethPkt.getSourceMAC().toString())
                             .get(targetAddress.toString())
                             .get(dstVlan);
-                    //log.info("New dst vlan: {}.", dstVlan);
                 }
             }
         }
@@ -981,7 +906,7 @@ public class SDNTest {
     }
 
     private void flood(Ethernet request, ConnectPoint inPort) {
-        log.info("Flood edge ports, vlan: {}.", request.getVlanID());
+        //log.info("Flood edge ports, vlan: {}.", request.getVlanID());
         TrafficTreatment.Builder builder = null;
         ByteBuffer buf = ByteBuffer.wrap(request.serialize());
 
@@ -990,7 +915,7 @@ public class SDNTest {
                 continue;
             }
 
-            log.info("Send connect point: {}.", connectPoint);
+            log.info("Arp Send connect point: {}.", connectPoint);
             builder = DefaultTrafficTreatment.builder();
             builder.setOutput(connectPoint.port());
             packetService.emit(new DefaultOutboundPacket(connectPoint.deviceId(),
