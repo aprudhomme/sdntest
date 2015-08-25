@@ -40,10 +40,13 @@ import org.onosproject.core.ApplicationId;
 import org.onosproject.core.CoreService;
 import org.onosproject.core.Permission;
 import org.onosproject.net.ConnectPoint;
+import org.onosproject.net.DefaultPath;
+import org.onosproject.net.device.DeviceService;
 import org.onosproject.net.Host;
 import org.onosproject.net.HostId;
 import org.onosproject.net.Link;
 import org.onosproject.net.Path;
+import org.onosproject.net.Port;
 import org.onosproject.net.PortNumber;
 import org.onosproject.net.flow.DefaultTrafficSelector;
 import org.onosproject.net.flow.DefaultTrafficTreatment;
@@ -62,18 +65,36 @@ import org.onosproject.net.packet.PacketContext;
 import org.onosproject.net.packet.PacketPriority;
 import org.onosproject.net.packet.PacketProcessor;
 import org.onosproject.net.packet.PacketService;
+import org.onosproject.net.topology.Topology;
 import org.onosproject.net.topology.TopologyService;
 import org.onosproject.net.packet.DefaultOutboundPacket;
 import org.onosproject.net.DeviceId;
 import org.osgi.service.component.ComponentContext;
-import org.slf4j.Logger;
+//import org.slf4j.Logger;
+//import org.onosproject.net.resource.link.BandwidthResourceRequest;
+import org.onosproject.net.resource.link.LinkResourceService;
+//import org.onosproject.net.resource.ResourceRequest;
+//import org.onosproject.net.resource.ResourceType;
 
+import org.onosproject.net.topology.DefaultTopologyVertex;
+import org.onosproject.net.topology.TopologyEdge;
+import org.onosproject.net.topology.TopologyVertex;
+
+import org.onlab.graph.Edge;
+import org.onlab.graph.EdgeWeight;
+import org.onlab.graph.GraphPathSearch;
+import org.onlab.graph.GraphPathSearch.Result;
+import org.onosproject.net.topology.TopologyGraph;
+import org.onosproject.common.DefaultTopology;
 import org.onosproject.net.proxyarp.ProxyArpService;
+import com.google.common.collect.ImmutableSet;
 
 import java.util.Dictionary;
 import java.util.Set;
 import java.util.Map;
 import java.util.HashMap;
+import java.util.List;
+import java.util.ArrayList;
 import java.util.ListIterator;
 import java.util.HashSet;
 import java.util.stream.Collectors;
@@ -85,18 +106,22 @@ import static org.slf4j.LoggerFactory.getLogger;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static org.onosproject.security.AppGuard.checkPermission;
 import static com.google.common.base.Preconditions.checkArgument;
+import static org.onlab.graph.GraphPathSearch.ALL_PATHS;
+import static org.onosproject.core.CoreService.CORE_PROVIDER_ID;
 /**
  * Sample forwarding application modified for vlan testing.
  */
 @Component(immediate = true)
 public class SDNTest {
 
+    private static final BWGraphSearch<TopologyVertex, TopologyEdge> BWSEARCH = new BWGraphSearch<>();
+
     private static final int DEFAULT_TIMEOUT = 0;
     private static final int DEFAULT_PRIORITY = 10;
     private static final String NOT_ARP_REQUEST = "ARP is not a request.";
     private static final String REQUEST_NULL = "ARP or NDP request cannot be null.";
 
-    private final Logger log = getLogger(getClass());
+    private final org.slf4j.Logger log = getLogger(getClass());
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     protected EdgePortService edgeService;
@@ -106,6 +131,9 @@ public class SDNTest {
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     protected TopologyService topologyService;
+
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
+    protected DeviceService deviceService;
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     protected PacketService packetService;
@@ -124,6 +152,9 @@ public class SDNTest {
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     protected ComponentConfigService cfgService;
+
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
+    protected LinkResourceService resourceService;
 
     private SDNTPacketProcessor processor = new SDNTPacketProcessor();
 
@@ -466,9 +497,9 @@ public class SDNTest {
                 return;
             }
 
-            log.info("smac: {}, dmac: {}, type: {}",
-                    ethPkt.getSourceMAC(), ethPkt.getDestinationMAC(), ethPkt.getEtherType());
-            log.info("vlan: {}, loc: {}.", ethPkt.getVlanID(), context.inPacket().receivedFrom());
+            //log.info("smac: {}, dmac: {}, type: {}",
+            //    ethPkt.getSourceMAC(), ethPkt.getDestinationMAC(), ethPkt.getEtherType());
+            //log.info("vlan: {}, loc: {}.", ethPkt.getVlanID(), context.inPacket().receivedFrom());
 
             // do proxy arp
             if (ethPkt.getEtherType() == Ethernet.TYPE_ARP) {
@@ -477,9 +508,9 @@ public class SDNTest {
             }
 
             Boolean mapVlans = false;
-            Short inVlan = ethPkt.getVlanID();
-            Short transVlan = ethPkt.getVlanID();
-            Short outVlan = ethPkt.getVlanID();
+            Short inVlan = -1;
+            Short transVlan = -1;
+            Short outVlan = -1;
 
             if (vlanTransMacMap.containsKey(ethPkt.getSourceMAC().toString())) {
                 if (vlanTransMacMap.get(ethPkt.getSourceMAC().toString())
@@ -505,6 +536,12 @@ public class SDNTest {
                     }
                 }
             }
+            // if not remapping, use packet vlan
+            if (!mapVlans) {
+                inVlan = ethPkt.getVlanID();
+                transVlan = ethPkt.getVlanID();
+                outVlan = ethPkt.getVlanID();
+            }
 
             sid = HostId.hostId(ethPkt.getSourceMAC(), VlanId.vlanId(inVlan));
 
@@ -524,30 +561,135 @@ public class SDNTest {
             // Do we know who this is for? If not, flood and bail.
             if (dst == null) {
                 // TODO: fix for vlan, only send out edges
-                log.info("flood dev: {}", pkt.receivedFrom().deviceId());
+                //log.info("flood dev: {}", pkt.receivedFrom().deviceId());
                 flood(context);
                 return;
             }
 
+            Port sPort = deviceService.getPort(src.location().deviceId(), src.location().port());
+            Port dPort = deviceService.getPort(dst.location().deviceId(), dst.location().port());
+            double targetSpeed = Math.min(sPort.portSpeed(), dPort.portSpeed());
             // Otherwise, get a set of paths that lead from here to the
             // destination edge switch.
-            Set<Path> paths =
-                    topologyService.getPaths(topologyService.currentTopology(),
-                                             src.location().deviceId(),
-                                             dst.location().deviceId());
+            //Set<Path> paths =
+            //        topologyService.getPaths(topologyService.currentTopology(),
+            //                                 src.location().deviceId(),
+            //                                 dst.location().deviceId());
+            Set<Path> paths = getPaths(src.location().deviceId(), dst.location().deviceId(), new BWWeight(),
+                    targetSpeed);
             if (paths.isEmpty()) {
+                paths = getPaths(src.location().deviceId(), dst.location().deviceId(), new BWWeight(), 0.0);
+            }
+
+            if (paths.isEmpty()) {
+                log.info("No paths found.");
                 // If there are no paths, flood and bail.
-                flood(context);
+                // change to flood edges?
+                //flood(context);
                 return;
             }
 
             // TODO: select path based on some property
-            Path path = (Path) paths.toArray()[0];
+            //Path path = (Path) paths.toArray()[0];
+            Path path = getMaxBWPath(paths);
 
             // Otherwise forward and be done with it.
             installRules(context, path, mapVlans, inVlan, transVlan, outVlan);
         }
 
+    }
+
+    public Set<Path> getPaths(DeviceId src, DeviceId dst, EdgeWeight w, double bwThresh) {
+        final DefaultTopologyVertex srcV = new DefaultTopologyVertex(src);
+        final DefaultTopologyVertex dstV = new DefaultTopologyVertex(dst);
+        Topology topology = topologyService.currentTopology();
+        if (!(topology instanceof DefaultTopology)) {
+            log.info("Topology not DefaultTopology");
+            return ImmutableSet.of();
+        }
+        DefaultTopology dtop = (DefaultTopology) topology;
+        TopologyGraph graph = dtop.getGraph();
+        Set<TopologyVertex> vertices = graph.getVertexes();
+        if (!vertices.contains(srcV) || !vertices.contains(dstV)) {
+            // src or dst not part of the current graph
+            return ImmutableSet.of();
+        }
+
+        GraphPathSearch.Result<TopologyVertex, TopologyEdge> result =
+                BWSEARCH.search(graph, srcV, dstV, w, ALL_PATHS, bwThresh);
+        ImmutableSet.Builder<Path> builder = ImmutableSet.builder();
+        for (org.onlab.graph.Path<TopologyVertex, TopologyEdge> path : result.paths()) {
+            builder.add(networkPath(path));
+        }
+        return builder.build();
+    }
+
+    // Converts graph path to a network path with the same cost.
+    private Path networkPath(org.onlab.graph.Path<TopologyVertex, TopologyEdge> path) {
+        List<Link> links = new ArrayList<>();
+        for (TopologyEdge edge : path.edges()) {
+            links.add(edge.link());
+        }
+        return new DefaultPath(CORE_PROVIDER_ID, links, path.cost());
+    }
+
+    private Path getMaxBWPath(Set<Path> paths) {
+        log.info("Got {} paths.", paths.size());
+        Path retPath = null;
+        double bestBW = -1.0;
+        for (Path path : paths) {
+            double pathLimit = Double.MAX_VALUE;
+            for (Link link : path.links()) {
+                Port srcp = deviceService.getPort(link.src().deviceId(), link.src().port());
+                Port dstp = deviceService.getPort(link.dst().deviceId(), link.dst().port());
+                double speed = Math.min(srcp.portSpeed(), dstp.portSpeed());
+                if (speed < pathLimit) {
+                    pathLimit = speed;
+                }
+                /*for (ResourceRequest request : resourceService.getAvailableResources(link)) {
+                    if (request.type() == ResourceType.BANDWIDTH) {
+                        BandwidthResourceRequest brr = (BandwidthResourceRequest) request;
+                        if (brr.bandwidth().toDouble() < pathLimit) {
+                            pathLimit = brr.bandwidth().toDouble();
+                        }
+                    }
+                }*/
+            }
+            log.info("Path limit: {}", pathLimit);
+
+            if (pathLimit > bestBW) {
+                bestBW = pathLimit;
+                retPath = path;
+            }
+        }
+        return retPath;
+    }
+
+    private class BWWeight implements EdgeWeight {
+        @Override
+        public double weight(Edge edge) {
+            if (!(edge instanceof TopologyEdge)) {
+                log.info("Edge not TopologyEdge");
+                return 1.0;
+            }
+
+            TopologyEdge tedge = (TopologyEdge) edge;
+
+            Port srcp = deviceService.getPort(tedge.link().src().deviceId(), tedge.link().src().port());
+            Port dstp = deviceService.getPort(tedge.link().dst().deviceId(), tedge.link().dst().port());
+            double speed = Math.min(srcp.portSpeed(), dstp.portSpeed());
+            //log.info("Link speed: {}, {}", speed, tedge);
+            return speed;
+            /*for (ResourceRequest request : resourceService.getAvailableResources(tedge.link())) {
+                if (request.type() == ResourceType.BANDWIDTH) {
+                    BandwidthResourceRequest brr = (BandwidthResourceRequest) request;
+                    log.info("Found edge bandwidth: {}, {}", brr.bandwidth().toDouble(), tedge);
+                    return brr.bandwidth().toDouble();
+                }
+            }*/
+            //log.info("Unable to find edge BW");
+            //return 1000000;
+        }
     }
 
     // Indicates whether this is a control packet, e.g. LLDP, BDDP
@@ -633,10 +775,8 @@ public class SDNTest {
             selectorBuilder.matchEthSrc(inPkt.getSourceMAC())
                     .matchEthDst(inPkt.getDestinationMAC());
 
-            // If configured Match Vlan ID
-            if (mapVlan) {
-                selectorBuilder.matchVlanId(VlanId.vlanId(vlanIn));
-            }
+            // Match Vlan ID
+            selectorBuilder.matchVlanId(VlanId.vlanId(vlanIn));
 
             //
             // If configured and EtherType is IPv4 - Match IPv4 and
@@ -762,13 +902,13 @@ public class SDNTest {
         ethPkt.setVlanID(dstVlan);
 
         if (arp.getOpCode() == ARP.OP_REPLY) {
-            log.info("Arp reply.");
+            //log.info("Arp reply.");
             forward(ethPkt, context.inPacket().receivedFrom());
         } else if (arp.getOpCode() == ARP.OP_REQUEST) {
-            log.info("Arp request.");
+            //log.info("Arp request.");
             replyArp(ethPkt, context.inPacket().receivedFrom());
         } else {
-            log.info("Unknown Arp op.");
+            //log.info("Unknown Arp op.");
             return false;
         }
         context.block();
@@ -915,7 +1055,7 @@ public class SDNTest {
                 continue;
             }
 
-            log.info("Arp Send connect point: {}.", connectPoint);
+            //log.info("Arp Send connect point: {}.", connectPoint);
             builder = DefaultTrafficTreatment.builder();
             builder.setOutput(connectPoint.port());
             packetService.emit(new DefaultOutboundPacket(connectPoint.deviceId(),
