@@ -29,7 +29,7 @@
     <artifactId>onos-sdntest-app</artifactId>
     <packaging>bundle</packaging>
 
-    <description>Reactive forwarding application using flow subsystem</description>
+    <description>Sample forwarding application modified for vlan testing</description>
 
     <properties>
         <onos.app.name>org.sdntest.app</onos.app.name>
@@ -45,6 +45,35 @@
             <groupId>org.onosproject</groupId>
             <artifactId>onos-core-common</artifactId>
         </dependency>
+
+        <dependency>
+            <groupId>org.apache.httpcomponents</groupId>
+            <artifactId>httpclient</artifactId>
+            <version>4.5</version>
+        </dependency>
+
+        <dependency>
+            <groupId>com.googlecode.json-simple</groupId>
+            <artifactId>json-simple</artifactId>
+            <version>1.1.1</version>
+        </dependency>
+
     </dependencies>
 
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.felix</groupId>
+                <artifactId>maven-bundle-plugin</artifactId>
+                <extensions>true</extensions>
+                <configuration>
+                    <instructions>
+                        <Export-Package>
+org.json.simple,org.json.simple.parser,org.apache.http.*,org.apache.commons.codec.*,org.apache.commons.logging.*,org.apache.commons.beanutils,org.apache.log
+                        </Export-Package>
+                    </instructions>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
 </project>

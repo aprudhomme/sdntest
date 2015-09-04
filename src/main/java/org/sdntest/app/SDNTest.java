@@ -22,6 +22,18 @@ import org.apache.felix.scr.annotations.Modified;
 import org.apache.felix.scr.annotations.Property;
 import org.apache.felix.scr.annotations.Reference;
 import org.apache.felix.scr.annotations.ReferenceCardinality;
+import org.apache.http.ParseException;
+import org.apache.http.auth.AuthenticationException;
+import org.apache.http.auth.UsernamePasswordCredentials;
+import org.apache.http.client.ClientProtocolException;
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.impl.auth.BasicScheme;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClientBuilder;
+import org.apache.http.util.EntityUtils;
+import org.json.simple.JSONObject;
+import org.json.simple.parser.JSONParser;
 import org.onlab.packet.Ethernet;
 import org.onlab.packet.ARP;
 import org.onlab.packet.IpAddress;
@@ -38,7 +50,6 @@ import org.onlab.packet.VlanId;
 import org.onosproject.cfg.ComponentConfigService;
 import org.onosproject.core.ApplicationId;
 import org.onosproject.core.CoreService;
-import org.onosproject.core.Permission;
 import org.onosproject.net.ConnectPoint;
 import org.onosproject.net.DefaultPath;
 import org.onosproject.net.device.DeviceService;
@@ -70,11 +81,10 @@ import org.onosproject.net.topology.TopologyService;
 import org.onosproject.net.packet.DefaultOutboundPacket;
 import org.onosproject.net.DeviceId;
 import org.osgi.service.component.ComponentContext;
-//import org.slf4j.Logger;
-//import org.onosproject.net.resource.link.BandwidthResourceRequest;
+import org.onosproject.net.resource.link.BandwidthResourceRequest;
 import org.onosproject.net.resource.link.LinkResourceService;
-//import org.onosproject.net.resource.ResourceRequest;
-//import org.onosproject.net.resource.ResourceType;
+import org.onosproject.net.resource.ResourceRequest;
+import org.onosproject.net.resource.ResourceType;
 
 import org.onosproject.net.topology.DefaultTopologyVertex;
 import org.onosproject.net.topology.TopologyEdge;
@@ -98,13 +108,15 @@ import java.util.ArrayList;
 import java.util.ListIterator;
 import java.util.HashSet;
 import java.util.stream.Collectors;
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 
 import static com.google.common.base.Strings.isNullOrEmpty;
 import static org.slf4j.LoggerFactory.getLogger;
 
 import static com.google.common.base.Preconditions.checkNotNull;
-import static org.onosproject.security.AppGuard.checkPermission;
 import static com.google.common.base.Preconditions.checkArgument;
 import static org.onlab.graph.GraphPathSearch.ALL_PATHS;
 import static org.onosproject.core.CoreService.CORE_PROVIDER_ID;
@@ -116,12 +128,17 @@ public class SDNTest {
 
     private static final BWGraphSearch<TopologyVertex, TopologyEdge> BWSEARCH = new BWGraphSearch<>();
 
-    private static final int DEFAULT_TIMEOUT = 0;
+    private static final int DEFAULT_TIMEOUT = 10;
     private static final int DEFAULT_PRIORITY = 10;
     private static final String NOT_ARP_REQUEST = "ARP is not a request.";
     private static final String REQUEST_NULL = "ARP or NDP request cannot be null.";
 
     private final org.slf4j.Logger log = getLogger(getClass());
+
+    private static final String GLOBUS_LOGIN_FILE = "/home/sdn/gllogin";
+    private static final String GLOBUS_REST_ROOT_URL = "https://transfer.api.globusonline.org/v0.10/";
+    private static final String GLOBUS_AUTH_URL =
+            "https://nexus.api.globusonline.org/goauth/token?grant_type=client_credentials";
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     protected EdgePortService edgeService;
@@ -512,6 +529,7 @@ public class SDNTest {
             Short transVlan = -1;
             Short outVlan = -1;
 
+            // lookup input, transit and output vlan IDs from mapping
             if (vlanTransMacMap.containsKey(ethPkt.getSourceMAC().toString())) {
                 if (vlanTransMacMap.get(ethPkt.getSourceMAC().toString())
                         .containsKey(ethPkt.getDestinationMAC().toString())) {
@@ -543,6 +561,7 @@ public class SDNTest {
                 outVlan = ethPkt.getVlanID();
             }
 
+            // use vlan to get source and destination hosts
             sid = HostId.hostId(ethPkt.getSourceMAC(), VlanId.vlanId(inVlan));
 
             if (mapVlans) {
@@ -558,45 +577,133 @@ public class SDNTest {
 
             //log.info("Hs: {}, Hd: {}.", src, dst);
 
-            // Do we know who this is for? If not, flood and bail.
+            // Do we know who this is for? If not, arp must have failed.
+            // Don't flood because the vlan could be wrong.
             if (dst == null) {
-                // TODO: fix for vlan, only send out edges
-                //log.info("flood dev: {}", pkt.receivedFrom().deviceId());
-                flood(context);
                 return;
             }
 
+            // see if flow is authorized, maybe do endpoint setup
+            // ignore result until fully implemented
+            flowAllowed();
+            //if (!flowAllowed()) {
+            //    return;
+            //}
+
+            // find the minimum port speed of the source and destination
             Port sPort = deviceService.getPort(src.location().deviceId(), src.location().port());
             Port dPort = deviceService.getPort(dst.location().deviceId(), dst.location().port());
             double targetSpeed = Math.min(sPort.portSpeed(), dPort.portSpeed());
-            // Otherwise, get a set of paths that lead from here to the
-            // destination edge switch.
-            //Set<Path> paths =
-            //        topologyService.getPaths(topologyService.currentTopology(),
-            //                                 src.location().deviceId(),
-            //                                 dst.location().deviceId());
+
+            // get the set of paths that have a bottleneck bandwidth
+            // of at least the minimum port speed
             Set<Path> paths = getPaths(src.location().deviceId(), dst.location().deviceId(), new BWWeight(),
                     targetSpeed);
+
+            // if no paths exist, find the one with the max bottleneck bandwidth
             if (paths.isEmpty()) {
                 paths = getPaths(src.location().deviceId(), dst.location().deviceId(), new BWWeight(), 0.0);
             }
 
+            // if no paths exist, bail
             if (paths.isEmpty()) {
                 log.info("No paths found.");
-                // If there are no paths, flood and bail.
-                // change to flood edges?
-                //flood(context);
                 return;
             }
 
-            // TODO: select path based on some property
-            //Path path = (Path) paths.toArray()[0];
+            // choose path with max bottleneck bandwidth,
+            // just an example selection, could be changed to something like hop
+            // count or path delay
             Path path = getMaxBWPath(paths);
 
-            // Otherwise forward and be done with it.
+            // install flow rules and forward packet as needed
             installRules(context, path, mapVlans, inVlan, transVlan, outVlan);
         }
 
+    }
+
+    // do authentication
+    // just a globus rest api example at the moment
+    private boolean flowAllowed() {
+        // get login info from file
+        // TODO: get from somewhere else, or setup certs
+        BufferedReader br = null;
+        String uname;
+        String password;
+        try {
+            br = new BufferedReader(new FileReader(GLOBUS_LOGIN_FILE));
+            uname = br.readLine();
+            password = br.readLine();
+        } catch (IOException e) {
+            log.info("Error reading globus login file: {}", GLOBUS_LOGIN_FILE);
+            return false;
+        } finally {
+            try {
+                if (br != null) {
+                    br.close();
+                }
+            } catch (IOException ex) {
+                log.info("Error closing globus login file");
+            }
+        }
+
+        if (uname == null || password == null) {
+            log.info("Error: could not get globus login from file");
+            return false;
+        } else {
+            log.info("Got globus login un: {}, pw: {}", uname, password);
+        }
+
+        // use login info to get authentication token
+        UsernamePasswordCredentials credentials = new UsernamePasswordCredentials(uname, password);
+        CloseableHttpClient httpclient = HttpClientBuilder.create().build();
+        HttpGet authGet = new HttpGet(GLOBUS_AUTH_URL);
+        try {
+            authGet.addHeader(new BasicScheme().authenticate(credentials, authGet));
+        } catch (AuthenticationException e1) {
+            e1.printStackTrace();
+        }
+        authGet.addHeader("User-Agent", "onos");
+        log.info(authGet.toString());
+
+        CloseableHttpResponse response1;
+        try {
+            response1 = httpclient.execute(authGet);
+        } catch (ClientProtocolException e) {
+            e.printStackTrace();
+            return false;
+        } catch (IOException e) {
+            e.printStackTrace();
+            return false;
+        }
+
+        String authTok = "";
+        try {
+            log.info(response1.toString());
+            String resStr = EntityUtils.toString(response1.getEntity());
+            log.info(resStr);
+            JSONParser jsonParser = new JSONParser();
+            JSONObject jsonObject = (JSONObject) jsonParser
+                    .parse(resStr);
+            authTok = (String) jsonObject.get("access_token");
+        } catch (IOException e) {
+            e.printStackTrace();
+            return false;
+        } catch (ParseException e) {
+            e.printStackTrace();
+            return false;
+        } catch (org.json.simple.parser.ParseException e) {
+            e.printStackTrace();
+        } finally {
+            try {
+                response1.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+
+        log.info("Token: {}", authTok);
+        return true;
     }
 
     public Set<Path> getPaths(DeviceId src, DeviceId dst, EdgeWeight w, double bwThresh) {
@@ -615,6 +722,7 @@ public class SDNTest {
             return ImmutableSet.of();
         }
 
+        // get all paths with the given bottleneck bandwidth threshold
         GraphPathSearch.Result<TopologyVertex, TopologyEdge> result =
                 BWSEARCH.search(graph, srcV, dstV, w, ALL_PATHS, bwThresh);
         ImmutableSet.Builder<Path> builder = ImmutableSet.builder();
@@ -633,6 +741,7 @@ public class SDNTest {
         return new DefaultPath(CORE_PROVIDER_ID, links, path.cost());
     }
 
+    // get path with max bottleneck bandwidth
     private Path getMaxBWPath(Set<Path> paths) {
         log.info("Got {} paths.", paths.size());
         Path retPath = null;
@@ -640,20 +749,14 @@ public class SDNTest {
         for (Path path : paths) {
             double pathLimit = Double.MAX_VALUE;
             for (Link link : path.links()) {
-                Port srcp = deviceService.getPort(link.src().deviceId(), link.src().port());
-                Port dstp = deviceService.getPort(link.dst().deviceId(), link.dst().port());
-                double speed = Math.min(srcp.portSpeed(), dstp.portSpeed());
-                if (speed < pathLimit) {
-                    pathLimit = speed;
-                }
-                /*for (ResourceRequest request : resourceService.getAvailableResources(link)) {
+                for (ResourceRequest request : resourceService.getAvailableResources(link)) {
                     if (request.type() == ResourceType.BANDWIDTH) {
                         BandwidthResourceRequest brr = (BandwidthResourceRequest) request;
                         if (brr.bandwidth().toDouble() < pathLimit) {
                             pathLimit = brr.bandwidth().toDouble();
                         }
                     }
-                }*/
+                }
             }
             log.info("Path limit: {}", pathLimit);
 
@@ -665,6 +768,7 @@ public class SDNTest {
         return retPath;
     }
 
+    // class used to provide link bandwidth to path search algorithm
     private class BWWeight implements EdgeWeight {
         @Override
         public double weight(Edge edge) {
@@ -675,20 +779,15 @@ public class SDNTest {
 
             TopologyEdge tedge = (TopologyEdge) edge;
 
-            Port srcp = deviceService.getPort(tedge.link().src().deviceId(), tedge.link().src().port());
-            Port dstp = deviceService.getPort(tedge.link().dst().deviceId(), tedge.link().dst().port());
-            double speed = Math.min(srcp.portSpeed(), dstp.portSpeed());
-            //log.info("Link speed: {}, {}", speed, tedge);
-            return speed;
-            /*for (ResourceRequest request : resourceService.getAvailableResources(tedge.link())) {
+            for (ResourceRequest request : resourceService.getAvailableResources(tedge.link())) {
                 if (request.type() == ResourceType.BANDWIDTH) {
                     BandwidthResourceRequest brr = (BandwidthResourceRequest) request;
                     log.info("Found edge bandwidth: {}, {}", brr.bandwidth().toDouble(), tedge);
                     return brr.bandwidth().toDouble();
                 }
-            }*/
-            //log.info("Unable to find edge BW");
-            //return 1000000;
+            }
+            log.info("Unable to find edge BW");
+            return 1.0;
         }
     }
 
@@ -747,22 +846,50 @@ public class SDNTest {
         Host dst = hostService.getHost(id);
         Host src = hostService.getHost(sid);
 
-        installRule(context, dst.location().port(), dst.location().deviceId(), mapVlans, transVlan, outVlan);
+        // install rules in devices, moving from destination to source
+        installRule(context, dst.location().port(), dst.location().deviceId(), mapVlans, transVlan, outVlan,
+                2 * flowTimeout);
         for (ListIterator<Link> it = path.links().listIterator(path.links().size()); it.hasPrevious();) {
             Link link = it.previous();
             if (link.src().deviceId().equals(src.location().deviceId())) {
-                installRule(context, link.src().port(), link.src().deviceId(), mapVlans, inVlan, transVlan);
+                installRule(context, link.src().port(), link.src().deviceId(), mapVlans, inVlan, transVlan,
+                        flowTimeout);
             } else {
-                installRule(context, link.src().port(), link.src().deviceId(), mapVlans, transVlan, transVlan);
+                installRule(context, link.src().port(), link.src().deviceId(), mapVlans, transVlan, transVlan,
+                        2 * flowTimeout);
             }
         }
 
-        packetOut(context, PortNumber.TABLE);
+        // see if device with the packet is in the installed path
+        if (deviceInPath(context.inPacket().receivedFrom().deviceId(), path)) {
+            packetOut(context, PortNumber.TABLE);
+        } else {
+            // device is not in the path, sending to table would be very bad,
+            // send to end of new path for now
+            TrafficTreatment.Builder builder = DefaultTrafficTreatment.builder();
+            builder.setOutput(PortNumber.TABLE);
+            packetService.emit(new DefaultOutboundPacket(dst.location().deviceId(),
+                    builder.build(), ByteBuffer.wrap(ethPkt.serialize())));
+        }
+    }
+
+    private boolean deviceInPath(DeviceId id, Path path) {
+        for (Link link : path.links()) {
+            if (link.src().deviceId().equals(id)) {
+                return true;
+            }
+        }
+        if (path.links().size() > 0) {
+            if (path.links().get(path.links().size() - 1).dst().deviceId().equals(id)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // Install a rule forwarding the packet to the specified port.
     private void installRule(PacketContext context, PortNumber portNumber, DeviceId device, Boolean mapVlan,
-            Short vlanIn, Short vlanOut) {
+            Short vlanIn, Short vlanOut, int timeout) {
         log.info("install rule: device: {}, port: {}, map: {}, vIn: {}, vout: {}", device, portNumber,
                 mapVlan, vlanIn, vlanOut);
 
@@ -782,6 +909,7 @@ public class SDNTest {
             // If configured and EtherType is IPv4 - Match IPv4 and
             // TCP/UDP/ICMP fields
             //
+            // not currently used
             if (matchIpv4Address && inPkt.getEtherType() == Ethernet.TYPE_IPV4) {
                 IPv4 ipv4Packet = (IPv4) inPkt.getPayload();
                 byte ipv4Protocol = ipv4Packet.getProtocol();
@@ -804,14 +932,14 @@ public class SDNTest {
                 if (matchTcpUdpPorts && ipv4Protocol == IPv4.PROTOCOL_TCP) {
                     TCP tcpPacket = (TCP) ipv4Packet.getPayload();
                     selectorBuilder.matchIPProtocol(ipv4Protocol)
-                            .matchTcpSrc(tcpPacket.getSourcePort())
-                            .matchTcpDst(tcpPacket.getDestinationPort());
+                            .matchTcpSrc((short) tcpPacket.getSourcePort())
+                            .matchTcpDst((short) tcpPacket.getDestinationPort());
                 }
                 if (matchTcpUdpPorts && ipv4Protocol == IPv4.PROTOCOL_UDP) {
                     UDP udpPacket = (UDP) ipv4Packet.getPayload();
                     selectorBuilder.matchIPProtocol(ipv4Protocol)
-                            .matchUdpSrc(udpPacket.getSourcePort())
-                            .matchUdpDst(udpPacket.getDestinationPort());
+                            .matchUdpSrc((short) udpPacket.getSourcePort())
+                            .matchUdpDst((short) udpPacket.getDestinationPort());
                 }
                 if (matchIcmpFields && ipv4Protocol == IPv4.PROTOCOL_ICMP) {
                     ICMP icmpPacket = (ICMP) ipv4Packet.getPayload();
@@ -825,6 +953,7 @@ public class SDNTest {
             // If configured and EtherType is IPv6 - Match IPv6 and
             // TCP/UDP/ICMP fields
             //
+            // not currently used
             if (matchIpv6Address && inPkt.getEtherType() == Ethernet.TYPE_IPV6) {
                 IPv6 ipv6Packet = (IPv6) inPkt.getPayload();
                 byte ipv6NextHeader = ipv6Packet.getNextHeader();
@@ -845,14 +974,14 @@ public class SDNTest {
                 if (matchTcpUdpPorts && ipv6NextHeader == IPv6.PROTOCOL_TCP) {
                     TCP tcpPacket = (TCP) ipv6Packet.getPayload();
                     selectorBuilder.matchIPProtocol(ipv6NextHeader)
-                            .matchTcpSrc(tcpPacket.getSourcePort())
-                            .matchTcpDst(tcpPacket.getDestinationPort());
+                            .matchTcpSrc((short) tcpPacket.getSourcePort())
+                            .matchTcpDst((short) tcpPacket.getDestinationPort());
                 }
                 if (matchTcpUdpPorts && ipv6NextHeader == IPv6.PROTOCOL_UDP) {
                     UDP udpPacket = (UDP) ipv6Packet.getPayload();
                     selectorBuilder.matchIPProtocol(ipv6NextHeader)
-                            .matchUdpSrc(udpPacket.getSourcePort())
-                            .matchUdpDst(udpPacket.getDestinationPort());
+                            .matchUdpSrc((short) udpPacket.getSourcePort())
+                            .matchUdpDst((short) udpPacket.getDestinationPort());
                 }
                 if (matchIcmpFields && ipv6NextHeader == IPv6.PROTOCOL_ICMP6) {
                     ICMP6 icmp6Packet = (ICMP6) ipv6Packet.getPayload();
@@ -862,10 +991,13 @@ public class SDNTest {
                 }
             }
         }
+
+        // remap vlan if needed
         TrafficTreatment.Builder treatment = DefaultTrafficTreatment.builder();
         if (mapVlan && !vlanIn.equals(vlanOut)) {
             treatment = treatment.setVlanId(VlanId.vlanId(vlanOut));
         }
+        // set output port on device
         treatment = treatment.setOutput(portNumber);
 
         ForwardingObjective forwardingObjective = DefaultForwardingObjective.builder()
@@ -874,7 +1006,7 @@ public class SDNTest {
                 .withPriority(flowPriority)
                 .withFlag(ForwardingObjective.Flag.VERSATILE)
                 .fromApp(appId)
-                //.makeTemporary(flowTimeout)
+                .makeTemporary(timeout)
                 .add();
 
         flowObjectiveService.forward(device,
@@ -885,6 +1017,7 @@ public class SDNTest {
         ARP arp = (ARP) ethPkt.getPayload();
         //log.info("Doing arp.");
 
+        // determine the destination vlan from map and set to arp packet
         short dstVlan = ethPkt.getVlanID();
         if (vlanDstIpMap.containsKey(ethPkt.getSourceMAC().toString())) {
             Ip4Address targetAddress = Ip4Address.valueOf(arp.getTargetProtocolAddress());
@@ -901,6 +1034,7 @@ public class SDNTest {
         }
         ethPkt.setVlanID(dstVlan);
 
+        // process arp
         if (arp.getOpCode() == ARP.OP_REPLY) {
             //log.info("Arp reply.");
             forward(ethPkt, context.inPacket().receivedFrom());
@@ -916,7 +1050,7 @@ public class SDNTest {
     }
 
     private void forward(Ethernet eth, ConnectPoint inPort) {
-        checkPermission(Permission.PACKET_WRITE);
+        //checkPermission(Permission.PACKET_WRITE);
 
         checkNotNull(eth, REQUEST_NULL);
 
