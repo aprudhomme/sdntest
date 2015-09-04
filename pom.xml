@@ -69,8 +69,11 @@
                 <configuration>
                     <instructions>
                         <Export-Package>
-org.json.simple,org.json.simple.parser,org.apache.http.*,org.apache.commons.codec.*,org.apache.commons.logging.*,org.apache.commons.beanutils,org.apache.log
+org.apache.log,org.sdntest.app.*
                         </Export-Package>
+                        <Private-Package>
+org.json.simple,org.json.simple.parser,org.apache.http.*,org.apache.commons.codec.*,org.apache.commons.logging.*
+                        </Private-Package>
                     </instructions>
                 </configuration>
             </plugin>
